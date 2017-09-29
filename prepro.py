@@ -1,23 +1,27 @@
+import sys
 import re
 import json
-import spacy
+import codecs
 import msgpack
 import unicodedata
+import random
 import numpy as np
 import pandas as pd
 import argparse
+import jieba.posseg as pseg
 import collections
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from drqa.utils import str2bool
 import logging
+import jieba
 
 parser = argparse.ArgumentParser(
     description='Preprocessing data files, about 10 minitues to run.'
 )
-parser.add_argument('--wv_file', default='glove/glove.840B.300d.txt',
+parser.add_argument('--wv_file', default='glove/chinese.emb',
                     help='path to word vector file.')
-parser.add_argument('--wv_dim', type=int, default=300,
+parser.add_argument('--wv_dim', type=int, default=64,
                     help='word vector dimension.')
 parser.add_argument('--wv_cased', type=str2bool, nargs='?',
                     const=True, default=True,
@@ -33,10 +37,10 @@ parser.add_argument('--batch_size', type=int, default=64,
                     help='batch size for multiprocess tokenizing and tagging.')
 
 args = parser.parse_args()
-trn_file = 'SQuAD/train-v1.1.json'
-dev_file = 'SQuAD/dev-v1.1.json'
-wv_file = args.wv_file
-wv_dim = args.wv_dim
+trn_file = 'SQuAD/train.json'
+dev_file = 'SQuAD/dev.json'
+wv_file = args.wv_file  # glove/chinese.emb
+wv_dim = args.wv_dim    # 64
 
 logging.basicConfig(format='%(asctime)s %(message)s', level=logging.DEBUG,
                     datefmt='%m/%d/%Y %I:%M:%S')
@@ -74,61 +78,96 @@ log.info('glove loaded.')
 
 def flatten_json(file, proc_func):
     '''A multi-processing wrapper for loading SQuAD data file.'''
-    with open(file) as f:
-        data = json.load(f)['data']
+    with codecs.open(file, 'r', encoding='utf8') as f:
+        data = [json.loads(pre_proc(line)) for line in f]
     with ProcessPoolExecutor(max_workers=args.threads) as executor:
         rows = executor.map(proc_func, data)
-    rows = sum(rows, [])
     return rows
 
 
-def proc_train(article):
-    '''Flatten each article in training data.'''
-    rows = []
-    for paragraph in article['paragraphs']:
-        context = paragraph['context']
-        for qa in paragraph['qas']:
-            id_, question, answers = qa['id'], qa['question'], qa['answers']
-            answer = answers[0]['text']  # in training data there's only one answer
-            answer_start = answers[0]['answer_start']
-            answer_end = answer_start + len(answer)
-            rows.append((id_, context, question, answer, answer_start, answer_end))
-    return rows
-
-
-def proc_dev(article):
-    '''Flatten each article in dev data'''
-    rows = []
-    for paragraph in article['paragraphs']:
-        context = paragraph['context']
-        for qa in paragraph['qas']:
-            id_, question, answers = qa['id'], qa['question'], qa['answers']
-            answers = [a['text'] for a in answers]
-            rows.append((id_, context, question, answers))
-    return rows
-train = flatten_json(trn_file, proc_train)
-train = pd.DataFrame(train,
-                     columns=['id', 'context', 'question', 'answer',
-                              'answer_start', 'answer_end'])
-dev = flatten_json(dev_file, proc_dev)
-dev = pd.DataFrame(dev,
-                   columns=['id', 'context', 'question', 'answers'])
-log.info('json data flattened.')
-
-nlp = spacy.load('en', parser=False, tagger=False, entity=False)
+def strQ2B(ustring):
+    """全角转半角"""
+    rstring = ""
+    for uchar in ustring:
+        inside_code=ord(uchar)
+        if inside_code == 12288:                              #全角空格直接转换
+            inside_code = 32
+        elif (inside_code >= 65281 and inside_code <= 65374): #全角字符（除空格）根据关系转化
+            inside_code -= 65248
+        rstring += chr(inside_code)
+    return rstring
 
 
 def pre_proc(text):
     '''normalize spaces in a string.'''
-    text = re.sub('\s+', ' ', text)
+    text = re.sub('\s+', '', text)
     return text
-context_iter = (pre_proc(c) for c in train.context)
-context_tokens = [[w.text for w in doc] for doc in nlp.pipe(
-    context_iter, batch_size=args.batch_size, n_threads=args.threads)]
+
+
+def proc_train(article):
+    '''process each line in train.json file'''
+    answer = article['answer']
+    question = article['query']
+    id_ = article['query_id']
+    answer_start = None
+    answer_end = None
+    context = None
+    passages = [strQ2B(x['passage_text']) for x in article['passages']]
+    valid_passages = []
+    for p in passages:
+        if answer in p:
+            valid_passages.append(p)
+    if answer and valid_passages:
+        context = random.choice(valid_passages)
+        answer_start = context.find(answer)
+        answer_end = answer_start + len(answer)
+    return (id_, context, question, answer, answer_start, answer_end)
+
+
+def proc_dev(article):
+    '''process each line in dev.json file'''
+    answer = article['answer']
+    question = article['query']
+    id_ = article['query_id']
+    answer_start = None
+    answer_end = None
+    context = None
+    passages = [strQ2B(x['passage_text']) for x in article['passages']]
+    valid_passages = []
+    for p in passages:
+        if answer in p:
+            valid_passages.append(p)
+    if answer and valid_passages:
+        context = random.choice(valid_passages)
+        answer_start = context.find(answer)
+        answer_end = answer_start + len(answer)
+    answers = [answer]
+    return (id_, context, question, answers)
+
+
+train = flatten_json(trn_file, proc_train)
+train = [x for x in train if x[1] is not None]
+log.info('filtered train %d has span in context' % len(train))
+train = pd.DataFrame(train,
+                     columns=['id', 'context', 'question', 'answer',
+                              'answer_start', 'answer_end'])
+dev = flatten_json(dev_file, proc_dev)
+dev = [x for x in dev if x[1] is not None]
+log.info('filtered dev %d has span in context' % len(dev))
+dev = pd.DataFrame(dev,
+                   columns=['id', 'context', 'question', 'answers'])
+log.info('json data flattened.')
+
+
+
+
+
+context_tokens = [jieba.lcut(doc) for doc in train.context]
+print(context_tokens[0])
 log.info('got intial tokens.')
 
 
-def get_answer_index(context, context_token, answer_start, answer_end):
+def get_answer_index(context, context_token, answer_start, answer_end, answer):
     '''
     Get exact indices of the answer in the tokens of the passage,
     according to the start and end position of the answer.
@@ -140,17 +179,15 @@ def get_answer_index(context, context_token, answer_start, answer_end):
         answer_end (int): the end position of the answer in the passage
 
     Returns:
-        (int, int): start index and end index of answer
+        (int, int): start index and end index of answer, ===close===
     '''
     p_str = 0
     p_token = 0
     while p_str < len(context):
-        if re.match('\s', context[p_str]):
-            p_str += 1
-            continue
         token = context_token[p_token]
         token_len = len(token)
         if context[p_str:p_str + token_len] != token:
+            print (context[p_str:p_str + token_len], token)
             return (None, None)
         if p_str == answer_start:
             t_start = p_token
@@ -162,10 +199,12 @@ def get_answer_index(context, context_token, answer_start, answer_end):
                 return (None, None)
         p_token += 1
     return (None, None)
+
+train.info()
 train['answer_start_token'], train['answer_end_token'] = \
-    zip(*[get_answer_index(a, b, c, d) for a, b, c, d in
+    zip(*[get_answer_index(a, b, c, d, e) for a, b, c, d, e in
           zip(train.context, context_tokens,
-              train.answer_start, train.answer_end)])
+              train.answer_start, train.answer_end, train.answer)])
 initial_len = len(train)
 train.dropna(inplace=True)
 log.info('drop {} inconsistent samples.'.format(initial_len - len(train)))
@@ -174,30 +213,28 @@ log.info('answer pointer generated.')
 questions = list(train.question) + list(dev.question)
 contexts = list(train.context) + list(dev.context)
 
-nlp = spacy.load('en')
-context_text = [pre_proc(c) for c in contexts]
-question_text = [pre_proc(q) for q in questions]
-question_docs = [doc for doc in nlp.pipe(
-    iter(question_text), batch_size=args.batch_size, n_threads=args.threads)]
-context_docs = [doc for doc in nlp.pipe(
-    iter(context_text), batch_size=args.batch_size, n_threads=args.threads)]
-if args.wv_cased:
-    question_tokens = [[normalize_text(w.text) for w in doc] for doc in question_docs]
-    context_tokens = [[normalize_text(w.text) for w in doc] for doc in context_docs]
-else:
-    question_tokens = [[normalize_text(w.text).lower() for w in doc] for doc in question_docs]
-    context_tokens = [[normalize_text(w.text).lower() for w in doc] for doc in context_docs]
-context_token_span = [[(w.idx, w.idx + len(w.text)) for w in doc] for doc in context_docs]
-context_tags = [[w.tag_ for w in doc] for doc in context_docs]
-context_ents = [[w.ent_type_ for w in doc] for doc in context_docs]
+context_text = contexts.copy()
+
+context_cuts = [list(pseg.cut(doc)) for doc in contexts]
+question_tokens = [jieba.lcut(x) for x in questions]
+context_tokens = [[v for v,f in doc] for doc in context_cuts]
+context_token_span = []
+for doc in context_tokens:
+    acc = 0
+    token_span = []
+    for tok in doc:
+        token_span.append((acc,acc + len(tok)))
+        acc += len(tok)
+    context_token_span.append(token_span)
+context_tags = [[f for v,f in doc] for doc in context_cuts]
+context_ents = [['O' for w in doc] for doc in context_tokens]
+
 context_features = []
-for question, context in zip(question_docs, context_docs):
-    question_word = {w.text for w in question}
-    question_lower = {w.text.lower() for w in question}
-    question_lemma = {w.lemma_ if w.lemma_ != '-PRON-' else w.text.lower() for w in question}
-    match_origin = [w.text in question_word for w in context]
-    match_lower = [w.text.lower() in question_lower for w in context]
-    match_lemma = [(w.lemma_ if w.lemma_ != '-PRON-' else w.text.lower()) in question_lemma for w in context]
+for question, context in zip(question_tokens, context_tokens):
+    question_word = {w for w in question}
+    match_origin = [w in question_word for w in context]
+    match_lower = match_origin.copy()
+    match_lemma = match_origin.copy()
     context_features.append(list(zip(match_origin, match_lower, match_lemma)))
 log.info('tokens generated')
 
@@ -243,7 +280,9 @@ for doc in context_tokens:
 context_features = [[list(w) + [tf] for w, tf in zip(doc, tfs)] for doc, tfs in
                     zip(context_features, context_tf)]
 # tags
-vocab_tag = list(nlp.tagger.tag_names)
+all_tags = set(sum(context_tags,[]))
+log.info("all tags: %s" % all_tags)
+vocab_tag = list(all_tags)
 context_tag_ids = token2id(context_tags, vocab_tag)
 # entities, build dict on the fly
 counter_ent = collections.Counter(w for doc in context_ents for w in doc)
@@ -292,6 +331,7 @@ result = {
     'trn_context_spans': context_token_span[:len(train)],
     'dev_context_spans': context_token_span[len(train):]
 }
+
 with open('SQuAD/data.msgpack', 'wb') as f:
     msgpack.dump(result, f)
 if args.sample_size:
@@ -312,6 +352,7 @@ if args.sample_size:
         'trn_context_spans': result['trn_context_spans'][:sample_size],
         'dev_context_spans': result['dev_context_spans'][:sample_size]
     }
+
     with open('SQuAD/sample.msgpack', 'wb') as f:
         msgpack.dump(sample, f)
 log.info('saved to disk.')
