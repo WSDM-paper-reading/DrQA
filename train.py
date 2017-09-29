@@ -345,8 +345,9 @@ def _f1_score(pred, answers):
 
     if pred is None or answers is None:
         return 0
-    g_tokens = _normalize_answer(pred).split()
-    scores = [_score(g_tokens, _normalize_answer(a).split()) for a in answers]
+    #g_tokens = _normalize_answer(pred).split()
+    g_tokens = list(pred)
+    scores = [_score(g_tokens, list(a)) for a in answers]
     return max(scores)
 
 
